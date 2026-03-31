@@ -7,14 +7,13 @@ build/
 dist/
 
 # Project Specific Files
-classflow.ico
-Classflow.spec
-codegen_launcher.py
-get_auth.py
+Classflow/App/classflow.ico
+Classflow/App/Classflow.spec
+Classflow/App/codegen_launcher.py
+Classflow/App/get_auth.py
 
 # Legacy Data (Folder)
-Legacy/
-
+Classflow/Legacy/
 
 # Sensitive Data 
 google_client_secret.json
