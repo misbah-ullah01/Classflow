@@ -1,29 +1,22 @@
-Classflow
+Classflow Guide 
 
-This project can run manually or through Windows Task Scheduler.
+This project can run manually or through a custom scheduled event made in Windows Task Scheduler.
 
-Daily schedule support (12:00 PM and 6:00 PM) is built into classflow.py.
+First-time setup (interactive dialog with checkboxes)
+On first launch, Classflow opens an interactive setup window where user can choose:
+- Assignment download folder (browse feature) Enable Sticky Notes sync checkbox
+- Enable timetable sync checkbox
+- Calendar id text field (default: primary), for other calendars head over to Google Calendar -> Settings (Gear icon) -> Choose desired calendar -> Navigate to the integrate calendar part and copy paste the Calendar ID this field. 
+- Enable Task Scheduler checkbox
+- Task Scheduler time (HH:MM)
+- Optional task name (default: Classflow Daily)
+- To check the task, press Windows + R on your keyboard, type taskschd.msc in the Run window, find your created task in the Active Tasks tab, you may delete the task from there. 
+- Command to manually remove leftover files incase automatic removal fails, this command clears the assignment history and removes all files from Local Appdata 
+- Remove-Item -Path "$env:LOCALAPPDATA\Classflow" -Recurse -Force -ErrorAction SilentlyContinue; Remove-Item -Path ".\assignment_history.json",".\deadlines.txt",".\assignment_deadlines.ics",".\assignment_deadlines_delta.ics" -Force -ErrorAction SilentlyContinue
 
-Install schedule (Python script mode)
-1. Open PowerShell in this folder.
-2. Run:
-	 py classflow.py --install-schedule
 
-Install schedule (compiled EXE mode)
-1. Build your EXE as usual.
-2. Run the EXE with:
-	 Classflow.exe --install-schedule
-
-The command automatically detects whether it is running as a .py script or as an .exe and creates two tasks:
-- Classflow Daily 12PM
-- Classflow Daily 6PM
-
-Remove schedule
-- Python script mode:
-	py classflow.py --remove-schedule
-- EXE mode:
-	Classflow.exe --remove-schedule
-
-Notes
-- Tasks are created as daily triggers at 12:00 and 18:00.
-- Existing tasks with the same names are overwritten when installing.
+Notes:
+- No default assignment folder is used.
+- If calendar sync is enabled and no calendar id is provided, primary is used.
+- If scheduler is enabled, one daily task is created at the provided time.
+- Setup values are saved under LOCALAPPDATA\\Classflow\\classflow_settings.json.

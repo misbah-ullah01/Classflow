@@ -9,6 +9,7 @@ import time
 import pyautogui
 import ctypes
 import sys
+import atexit
 from datetime import datetime, timedelta, timezone
 from playwright.sync_api import sync_playwright
 
@@ -38,29 +39,29 @@ PROFILE_DIR = os.path.join(os.environ['LOCALAPPDATA'], "Classflow")
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR = os.path.dirname(SCRIPT_DIR)
 
-# Downloads remain on Desktop for easy access.
-USER_DESKTOP = os.path.join(os.environ['USERPROFILE'], 'Desktop')
-
-DOWNLOAD_DIR = os.path.join(USER_DESKTOP, "Assignments")
 DEADLINE_FILE = os.path.join(OUTPUT_DIR, "deadlines.txt")
 HISTORY_FILE = os.path.join(OUTPUT_DIR, "assignment_history.json")
 GOOGLE_SETUP_FILE = os.path.join(PROFILE_DIR, "google_calendar_setup.flag")
 TEAMS_SETUP_FILE = os.path.join(PROFILE_DIR, "teams_setup.flag")
 GOOGLE_TOKEN_FILE = os.path.join(PROFILE_DIR, "google_token.json")
+SETTINGS_FILE = os.path.join(PROFILE_DIR, "classflow_settings.json")
 GOOGLE_SCOPES = ["https://www.googleapis.com/auth/calendar.events"]
 GOOGLE_CLIENT_SECRET_CANDIDATES = [
     "google_client_secret.json",
     "credentials.json",
     "client_secret.json"
 ]
-# Set this to your target Google Calendar ID to avoid using My Calendar.
-# Example: "abc123@group.calendar.google.com"
-GOOGLE_CALENDAR_ID = "primary"
-TASK_NAME_NOON = "Classflow Daily 12PM"
-TASK_NAME_EVENING = "Classflow Daily 6PM"
-
-if not os.path.exists(DOWNLOAD_DIR):
-    os.makedirs(DOWNLOAD_DIR)
+DEFAULT_TASK_NAME = "Classflow Daily"
+DEFAULT_SETTINGS = {
+    "download_dir": "",
+    "sticky_notes_enabled": True,
+    "calendar_sync_enabled": True,
+    "calendar_id": "primary",
+    "scheduler_enabled": False,
+    "scheduler_time": "12:00",
+    "scheduler_task_name": DEFAULT_TASK_NAME,
+}
+WINDOWS_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
 
 # --- YOUR CUSTOM NAMING CONVENTION ---
 COURSE_MAP = {
@@ -84,6 +85,363 @@ def save_history(history):
     """Save assignment history to JSON file."""
     with open(HISTORY_FILE, "w", encoding="utf-8") as f:
         json.dump(history, f, indent=2, ensure_ascii=False)
+
+def load_settings():
+    """Load user settings and merge with defaults."""
+    merged = dict(DEFAULT_SETTINGS)
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                merged.update(loaded)
+        except Exception:
+            pass
+
+    merged["download_dir"] = (merged.get("download_dir") or "").strip()
+    merged["calendar_id"] = (merged.get("calendar_id") or "primary").strip() or "primary"
+    merged["scheduler_task_name"] = (merged.get("scheduler_task_name") or DEFAULT_TASK_NAME).strip() or DEFAULT_TASK_NAME
+    merged["scheduler_time"] = (merged.get("scheduler_time") or "12:00").strip()
+    merged["sticky_notes_enabled"] = bool(merged.get("sticky_notes_enabled", True))
+    merged["calendar_sync_enabled"] = bool(merged.get("calendar_sync_enabled", True))
+    merged["scheduler_enabled"] = bool(merged.get("scheduler_enabled", False))
+    return merged
+
+def save_settings(settings):
+    """Persist runtime settings to user profile."""
+    os.makedirs(PROFILE_DIR, exist_ok=True)
+    payload = dict(DEFAULT_SETTINGS)
+    payload.update(settings or {})
+    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+
+def normalize_directory_path(path_value):
+    """Normalize and expand a path value from config or CLI."""
+    return os.path.abspath(os.path.expandvars(os.path.expanduser(path_value.strip())))
+
+def is_valid_time_format(hhmm):
+    """Return True when time uses 24h HH:MM format."""
+    try:
+        datetime.strptime(hhmm, "%H:%M")
+        return True
+    except Exception:
+        return False
+
+def select_download_directory():
+    """Show native Windows folder picker for choosing assignment download path."""
+    try:
+        if os.name != "nt":
+            return ""
+
+        ps_script = (
+            "Add-Type -AssemblyName System.Windows.Forms;"
+            "$dialog = New-Object System.Windows.Forms.FolderBrowserDialog;"
+            "$dialog.Description = 'Choose folder for Classflow assignment downloads';"
+            "$dialog.ShowNewFolderButton = $true;"
+            "$result = $dialog.ShowDialog();"
+            "if ($result -eq [System.Windows.Forms.DialogResult]::OK) {"
+            "  [Console]::OutputEncoding = [System.Text.Encoding]::UTF8;"
+            "  Write-Output $dialog.SelectedPath"
+            "}"
+        )
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-Command", ps_script],
+            capture_output=True,
+            text=True,
+            check=False,
+            creationflags=WINDOWS_NO_WINDOW,
+        )
+        selected = (result.stdout or "").strip()
+        return normalize_directory_path(selected) if selected else ""
+    except Exception:
+        return ""
+
+def ensure_download_directory_configured(settings):
+    """Ensure required download directory is available before runtime."""
+    chosen = (settings.get("download_dir") or "").strip()
+    if chosen:
+        normalized = normalize_directory_path(chosen)
+        os.makedirs(normalized, exist_ok=True)
+        settings["download_dir"] = normalized
+        return normalized
+
+    show_windows_popup(
+        "Classflow Setup",
+        "Please choose where assignments should be downloaded."
+    )
+    selected = select_download_directory()
+    if not selected:
+        show_windows_popup(
+            "Classflow Setup",
+            "A download folder is required. Run setup again and choose a folder."
+        )
+        return ""
+
+    os.makedirs(selected, exist_ok=True)
+    settings["download_dir"] = selected
+    save_settings(settings)
+    return selected
+
+def apply_setup_preferences(
+    download_dir=None,
+    sticky_notes_enabled=None,
+    calendar_sync_enabled=None,
+    calendar_id=None,
+    scheduler_enabled=None,
+    scheduler_time=None,
+    scheduler_task_name=None,
+):
+    """Apply first-run preferences, typically passed by MSI/WPF setup."""
+    settings = load_settings()
+
+    if download_dir is not None:
+        normalized = normalize_directory_path(download_dir)
+        os.makedirs(normalized, exist_ok=True)
+        settings["download_dir"] = normalized
+
+    if sticky_notes_enabled is not None:
+        settings["sticky_notes_enabled"] = bool(sticky_notes_enabled)
+
+    if calendar_sync_enabled is not None:
+        settings["calendar_sync_enabled"] = bool(calendar_sync_enabled)
+
+    if calendar_id is not None:
+        settings["calendar_id"] = (calendar_id or "primary").strip() or "primary"
+
+    if scheduler_time is not None:
+        if not is_valid_time_format(scheduler_time):
+            raise ValueError("Scheduler time must be HH:MM in 24-hour format.")
+        settings["scheduler_time"] = scheduler_time
+
+    if scheduler_task_name is not None:
+        settings["scheduler_task_name"] = (scheduler_task_name or DEFAULT_TASK_NAME).strip() or DEFAULT_TASK_NAME
+
+    if scheduler_enabled is not None:
+        settings["scheduler_enabled"] = bool(scheduler_enabled)
+
+    save_settings(settings)
+
+    if settings.get("scheduler_enabled"):
+        create_windows_task(settings["scheduler_task_name"], settings["scheduler_time"])
+
+    return settings
+
+def show_first_time_setup_dialog():
+    """Show interactive first-time setup dialog with checkboxes and return selected values."""
+    if os.name != "nt":
+        return None
+
+    ps_script = r'''
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+$form = New-Object System.Windows.Forms.Form
+$form.Text = "Classflow First-Time Setup"
+$form.StartPosition = "CenterScreen"
+$form.Size = New-Object System.Drawing.Size(620, 390)
+$form.FormBorderStyle = "FixedDialog"
+$form.MaximizeBox = $false
+$form.MinimizeBox = $false
+$form.TopMost = $true
+
+$lblDownload = New-Object System.Windows.Forms.Label
+$lblDownload.Text = "Download folder for assignments"
+$lblDownload.Location = New-Object System.Drawing.Point(20, 20)
+$lblDownload.Size = New-Object System.Drawing.Size(280, 20)
+$form.Controls.Add($lblDownload)
+
+$txtDownload = New-Object System.Windows.Forms.TextBox
+$txtDownload.Location = New-Object System.Drawing.Point(20, 45)
+$txtDownload.Size = New-Object System.Drawing.Size(470, 24)
+$form.Controls.Add($txtDownload)
+
+$btnBrowse = New-Object System.Windows.Forms.Button
+$btnBrowse.Text = "Browse"
+$btnBrowse.Location = New-Object System.Drawing.Point(500, 43)
+$btnBrowse.Size = New-Object System.Drawing.Size(90, 28)
+$btnBrowse.Add_Click({
+    $folder = New-Object System.Windows.Forms.FolderBrowserDialog
+    $folder.Description = "Choose folder for Classflow assignment downloads"
+    $folder.ShowNewFolderButton = $true
+    if ($folder.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+        $txtDownload.Text = $folder.SelectedPath
+    }
+})
+$form.Controls.Add($btnBrowse)
+
+$chkSticky = New-Object System.Windows.Forms.CheckBox
+$chkSticky.Text = "Enable Sticky Notes sync"
+$chkSticky.Location = New-Object System.Drawing.Point(20, 90)
+$chkSticky.Size = New-Object System.Drawing.Size(260, 24)
+$chkSticky.Checked = $true
+$form.Controls.Add($chkSticky)
+
+$chkCalendar = New-Object System.Windows.Forms.CheckBox
+$chkCalendar.Text = "Enable timetable calendar sync"
+$chkCalendar.Location = New-Object System.Drawing.Point(20, 125)
+$chkCalendar.Size = New-Object System.Drawing.Size(280, 24)
+$chkCalendar.Checked = $true
+$form.Controls.Add($chkCalendar)
+
+$lblCalendar = New-Object System.Windows.Forms.Label
+$lblCalendar.Text = "Calendar ID"
+$lblCalendar.Location = New-Object System.Drawing.Point(40, 155)
+$lblCalendar.Size = New-Object System.Drawing.Size(120, 20)
+$form.Controls.Add($lblCalendar)
+
+$txtCalendar = New-Object System.Windows.Forms.TextBox
+$txtCalendar.Location = New-Object System.Drawing.Point(160, 152)
+$txtCalendar.Size = New-Object System.Drawing.Size(300, 24)
+$txtCalendar.Text = "primary"
+$form.Controls.Add($txtCalendar)
+
+$chkScheduler = New-Object System.Windows.Forms.CheckBox
+$chkScheduler.Text = "Create Windows scheduled task"
+$chkScheduler.Location = New-Object System.Drawing.Point(20, 195)
+$chkScheduler.Size = New-Object System.Drawing.Size(280, 24)
+$chkScheduler.Checked = $false
+$form.Controls.Add($chkScheduler)
+
+$lblTime = New-Object System.Windows.Forms.Label
+$lblTime.Text = "Task time (24h)"
+$lblTime.Location = New-Object System.Drawing.Point(40, 225)
+$lblTime.Size = New-Object System.Drawing.Size(120, 20)
+$form.Controls.Add($lblTime)
+
+$timePicker = New-Object System.Windows.Forms.DateTimePicker
+$timePicker.Location = New-Object System.Drawing.Point(160, 222)
+$timePicker.Size = New-Object System.Drawing.Size(120, 24)
+$timePicker.Format = [System.Windows.Forms.DateTimePickerFormat]::Custom
+$timePicker.CustomFormat = "HH:mm"
+$timePicker.ShowUpDown = $true
+$timePicker.Value = [datetime]::Today.AddHours(12)
+$timePicker.Enabled = $false
+$form.Controls.Add($timePicker)
+
+$lblTask = New-Object System.Windows.Forms.Label
+$lblTask.Text = "Task name"
+$lblTask.Location = New-Object System.Drawing.Point(40, 255)
+$lblTask.Size = New-Object System.Drawing.Size(120, 20)
+$form.Controls.Add($lblTask)
+
+$txtTaskName = New-Object System.Windows.Forms.TextBox
+$txtTaskName.Location = New-Object System.Drawing.Point(160, 252)
+$txtTaskName.Size = New-Object System.Drawing.Size(300, 24)
+$txtTaskName.Text = "Classflow Daily"
+$txtTaskName.Enabled = $false
+$form.Controls.Add($txtTaskName)
+
+$chkCalendar.Add_CheckedChanged({
+    $txtCalendar.Enabled = $chkCalendar.Checked
+})
+
+$chkScheduler.Add_CheckedChanged({
+    $timePicker.Enabled = $chkScheduler.Checked
+    $txtTaskName.Enabled = $chkScheduler.Checked
+})
+
+$btnOk = New-Object System.Windows.Forms.Button
+$btnOk.Text = "Save Setup"
+$btnOk.Location = New-Object System.Drawing.Point(380, 305)
+$btnOk.Size = New-Object System.Drawing.Size(100, 30)
+$form.Controls.Add($btnOk)
+
+$btnCancel = New-Object System.Windows.Forms.Button
+$btnCancel.Text = "Cancel"
+$btnCancel.Location = New-Object System.Drawing.Point(490, 305)
+$btnCancel.Size = New-Object System.Drawing.Size(100, 30)
+$btnCancel.Add_Click({
+    $form.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $form.Close()
+})
+$form.Controls.Add($btnCancel)
+
+$script:SetupJson = $null
+$btnOk.Add_Click({
+    if ([string]::IsNullOrWhiteSpace($txtDownload.Text)) {
+        [System.Windows.Forms.MessageBox]::Show("Please choose a download folder.", "Classflow Setup") | Out-Null
+        return
+    }
+
+    if ($chkCalendar.Checked -and [string]::IsNullOrWhiteSpace($txtCalendar.Text)) {
+        [System.Windows.Forms.MessageBox]::Show("Please enter Calendar ID or leave timetable sync unchecked.", "Classflow Setup") | Out-Null
+        return
+    }
+
+    $calendarId = "primary"
+    if ($chkCalendar.Checked) {
+        $calendarId = $txtCalendar.Text.Trim()
+    }
+
+    $taskName = $txtTaskName.Text.Trim()
+    if ([string]::IsNullOrWhiteSpace($taskName)) {
+        $taskName = "Classflow Daily"
+    }
+
+    $payload = @{
+        download_dir = $txtDownload.Text.Trim()
+        sticky_notes_enabled = $chkSticky.Checked
+        calendar_sync_enabled = $chkCalendar.Checked
+        calendar_id = $calendarId
+        scheduler_enabled = $chkScheduler.Checked
+        scheduler_time = $timePicker.Value.ToString("HH:mm")
+        scheduler_task_name = $taskName
+    }
+
+    $script:SetupJson = $payload | ConvertTo-Json -Compress
+    $form.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $form.Close()
+})
+
+$form.AcceptButton = $btnOk
+$form.CancelButton = $btnCancel
+
+$result = $form.ShowDialog()
+if ($result -eq [System.Windows.Forms.DialogResult]::OK -and $script:SetupJson) {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    Write-Output $script:SetupJson
+}
+'''
+
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-Command", ps_script],
+            capture_output=True,
+            text=True,
+            check=False,
+            creationflags=WINDOWS_NO_WINDOW,
+        )
+        setup_json = (result.stdout or "").strip()
+        if not setup_json:
+            return None
+        return json.loads(setup_json)
+    except Exception:
+        return None
+
+def ensure_first_time_setup_completed():
+    """Run interactive setup wizard once and persist settings."""
+    if os.path.exists(SETTINGS_FILE):
+        return load_settings()
+
+    payload = show_first_time_setup_dialog()
+    if not payload:
+        log_output("First-time setup cancelled by user.", show_popup=False)
+        return None
+
+    try:
+        apply_setup_preferences(
+            download_dir=payload.get("download_dir"),
+            sticky_notes_enabled=payload.get("sticky_notes_enabled"),
+            calendar_sync_enabled=payload.get("calendar_sync_enabled"),
+            calendar_id=payload.get("calendar_id"),
+            scheduler_enabled=payload.get("scheduler_enabled"),
+            scheduler_time=payload.get("scheduler_time"),
+            scheduler_task_name=payload.get("scheduler_task_name"),
+        )
+        return load_settings()
+    except Exception as exc:
+        show_windows_popup("Classflow Setup Error", f"Setup failed: {exc}")
+        return None
 
 def normalize_text(value):
     """Collapse repeated whitespace and trim leading/trailing spaces."""
@@ -142,7 +500,135 @@ def parse_due_date(raw_due_date):
 
 # Detect if running as frozen EXE
 IS_FROZEN = getattr(sys, "frozen", False)
-EXE_LOG_FILE = os.path.join(os.path.expanduser("~"), "Desktop", "Classflow_Log.txt") if IS_FROZEN else None
+EXE_LOG_FILE = os.path.join(PROFILE_DIR, "classflow_log.txt") if IS_FROZEN else None
+RUNTIME_LOG_FILE = os.path.join(PROFILE_DIR, "classflow_runtime.log")
+LOGGER_SCRIPT_FILE = os.path.join(PROFILE_DIR, "classflow_logger_viewer.ps1")
+_RUNTIME_LOG_HANDLE = None
+
+class TeeRuntimeStream:
+    """Mirror stdout/stderr writes to a runtime log file."""
+    def __init__(self, original_stream, mirror_handle):
+        self.original_stream = original_stream
+        self.mirror_handle = mirror_handle
+        self.encoding = getattr(original_stream, "encoding", "utf-8")
+
+    def write(self, data):
+        if not data:
+            return 0
+        if self.original_stream:
+            try:
+                self.original_stream.write(data)
+            except Exception:
+                pass
+        try:
+            self.mirror_handle.write(data)
+            self.mirror_handle.flush()
+        except Exception:
+            pass
+        return len(data)
+
+    def flush(self):
+        if self.original_stream:
+            try:
+                self.original_stream.flush()
+            except Exception:
+                pass
+        try:
+            self.mirror_handle.flush()
+        except Exception:
+            pass
+
+def _write_logger_viewer_script(script_path):
+    """Create a native WPF log viewer script used by frozen EXE mode."""
+    ps_script = r'''param([Parameter(Mandatory=$true)][string]$LogPath)
+
+Add-Type -AssemblyName PresentationFramework
+Add-Type -AssemblyName PresentationCore
+Add-Type -AssemblyName WindowsBase
+
+[xml]$xaml = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Classflow Logger"
+        WindowStartupLocation="CenterScreen"
+        SizeToContent="Manual"
+        Width="760"
+        Height="420"
+        Topmost="True"
+        ResizeMode="CanResizeWithGrip"
+        Background="#FFF0F0F0">
+    <Grid Margin="10">
+        <TextBox Name="LogBox"
+                 FontFamily="Consolas"
+                 FontSize="12"
+                 IsReadOnly="True"
+                 AcceptsReturn="True"
+                 TextWrapping="NoWrap"
+                 VerticalScrollBarVisibility="Auto"
+                 HorizontalScrollBarVisibility="Auto"/>
+    </Grid>
+</Window>
+"@
+
+$reader = New-Object System.Xml.XmlNodeReader $xaml
+$window = [Windows.Markup.XamlReader]::Load($reader)
+$logBox = $window.FindName("LogBox")
+
+function Update-LogBox {
+    if (Test-Path $LogPath) {
+        try {
+            $lines = Get-Content -Path $LogPath -Tail 300 -ErrorAction Stop
+            $text = [string]::Join("`r`n", $lines)
+            if ($logBox.Text -ne $text) {
+                $logBox.Text = $text
+                $logBox.ScrollToEnd()
+            }
+        } catch {
+        }
+    }
+}
+
+$timer = New-Object System.Windows.Threading.DispatcherTimer
+$timer.Interval = [TimeSpan]::FromMilliseconds(700)
+$timer.Add_Tick({ Update-LogBox })
+$timer.Start()
+
+Update-LogBox
+[void]$window.ShowDialog()
+'''
+    with open(script_path, "w", encoding="utf-8") as f:
+        f.write(ps_script)
+
+def _start_wpf_runtime_logger(log_path):
+    """Disabled: runtime logs are now file-only and no external log window is launched."""
+    return
+
+def initialize_runtime_logging():
+    """Route print output to file in EXE mode without opening an external log window."""
+    global _RUNTIME_LOG_HANDLE
+    if _RUNTIME_LOG_HANDLE is not None:
+        return
+    try:
+        os.makedirs(PROFILE_DIR, exist_ok=True)
+        _RUNTIME_LOG_HANDLE = open(RUNTIME_LOG_FILE, "w", encoding="utf-8", buffering=1)
+        _RUNTIME_LOG_HANDLE.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Classflow run started\n")
+        sys.stdout = TeeRuntimeStream(sys.stdout, _RUNTIME_LOG_HANDLE)
+        sys.stderr = TeeRuntimeStream(sys.stderr, _RUNTIME_LOG_HANDLE)
+    except Exception:
+        _RUNTIME_LOG_HANDLE = None
+
+def close_runtime_logging():
+    """Close runtime log file handle on process shutdown."""
+    global _RUNTIME_LOG_HANDLE
+    if _RUNTIME_LOG_HANDLE is not None:
+        try:
+            _RUNTIME_LOG_HANDLE.flush()
+            _RUNTIME_LOG_HANDLE.close()
+        except Exception:
+            pass
+        _RUNTIME_LOG_HANDLE = None
+
+atexit.register(close_runtime_logging)
 
 def show_windows_popup(title, message):
     """Show a Windows popup message and log to file if running as EXE."""
@@ -203,15 +689,11 @@ def delete_windows_task(task_name):
     if result.returncode != 0 and "cannot find" not in result.stderr.lower():
         raise RuntimeError(result.stderr.strip() or result.stdout.strip())
 
-def install_schedule():
-    """Install two daily tasks at 12:00 and 18:00."""
-    create_windows_task(TASK_NAME_NOON, "12:00")
-    create_windows_task(TASK_NAME_EVENING, "18:00")
-
-def remove_schedule():
-    """Remove both daily Classflow tasks."""
-    delete_windows_task(TASK_NAME_NOON)
-    delete_windows_task(TASK_NAME_EVENING)
+def remove_configured_schedule_task(settings):
+    """Remove the configurable single schedule task if present."""
+    task_name = (settings.get("scheduler_task_name") or "").strip()
+    if task_name:
+        delete_windows_task(task_name)
 
 def is_google_setup_complete():
     """Check whether one-time Google Calendar setup has been completed."""
@@ -244,7 +726,7 @@ def resolve_google_client_secret_path():
 
     return None
 
-def get_google_calendar_service(interactive_auth):
+def get_google_calendar_service(interactive_auth, show_prompt_before_auth=False):
     """Create an authenticated Google Calendar service instance."""
     if not all([Request, Credentials, InstalledAppFlow, build]):
         show_windows_popup(
@@ -273,6 +755,11 @@ def get_google_calendar_service(interactive_auth):
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         elif (not creds or not creds.valid) and interactive_auth:
+            if show_prompt_before_auth:
+                show_windows_popup(
+                    "Classflow Google Authentication",
+                    "Press OK to open Google sign-in and complete authentication."
+                )
             flow = InstalledAppFlow.from_client_secrets_file(client_secret_path, GOOGLE_SCOPES)
             creds = flow.run_local_server(port=0)
 
@@ -319,7 +806,7 @@ def make_google_event_id(unique_name):
     digest = hashlib.sha1(unique_name.encode("utf-8")).hexdigest()
     return f"cf{digest}"
 
-def sync_deadlines_to_google_calendar(deadlines, interactive_auth):
+def sync_deadlines_to_google_calendar(deadlines, interactive_auth, calendar_id):
     """Insert/update changed deadlines in Google Calendar through API."""
     if not deadlines:
         return {"ok": True, "inserted": 0, "updated": 0, "skipped": 0, "failed": 0}
@@ -328,7 +815,7 @@ def sync_deadlines_to_google_calendar(deadlines, interactive_auth):
     if not service:
         return {"ok": False, "inserted": 0, "updated": 0, "skipped": 0, "failed": len(deadlines)}
 
-    calendar_id = os.environ.get("CLASSFLOW_CALENDAR_ID", GOOGLE_CALENDAR_ID)
+    calendar_id = (calendar_id or "primary").strip() or "primary"
     inserted = 0
     updated = 0
     skipped = 0
@@ -371,22 +858,22 @@ def sync_deadlines_to_google_calendar(deadlines, interactive_auth):
 
 def open_teams_and_wait_for_assignments(page, setup_mode=False):
     """Open Teams and wait until the Assignments app is available."""
-    log_output("Opening Microsoft Teams...", show_popup=IS_FROZEN, title="Classflow")
+    log_output("Opening Microsoft Teams...", show_popup=False, title="Classflow")
     page.set_default_navigation_timeout(60000)
     page.set_default_timeout(600000 if setup_mode else 60000)
+
+    if setup_mode:
+        show_windows_popup(
+            "Teams Setup",
+            "Press OK to open Teams sign-in in Chrome. Complete login and any prompts, then continue."
+        )
+        log_output("Teams setup required. Chrome will open for sign-in after this prompt.", show_popup=False, title="Classflow Setup")
 
     try:
         page.goto("https://teams.microsoft.com/v2/", timeout=60000)
     except Exception as nav_err:
         log_output(f"Teams navigation timeout, retrying once: {nav_err}", show_popup=False)
         page.goto("https://teams.microsoft.com/v2/", timeout=60000)
-
-    if setup_mode:
-        show_windows_popup(
-            "Teams Setup",
-            "Please sign in to Microsoft Teams in the opened Chrome window and complete any prompts."
-        )
-        log_output("Teams setup required. Please complete login in the opened Chrome window.", show_popup=IS_FROZEN, title="Classflow Setup")
 
     log_output("Waiting for Teams Assignments to become available...", show_popup=False)
     total_timeout = 600000 if setup_mode else 120000
@@ -476,7 +963,7 @@ def format_assignment_name(course_name, assignment_title):
 
 def first_time_setup():
     """Complete one-time Teams and Google setup, then ask user to rerun."""
-    log_output("First-time setup detected. Starting account setup...", show_popup=IS_FROZEN, title="Classflow Setup")
+    log_output("First-time setup detected. Starting account setup...", show_popup=False, title="Classflow Setup")
 
     with sync_playwright() as p:
         context = p.chromium.launch_persistent_context(
@@ -493,23 +980,20 @@ def first_time_setup():
             if teams_ok:
                 mark_teams_setup_complete()
 
-        google_ok = is_google_setup_complete()
-        if not google_ok:
-            google_ok = get_google_calendar_service(interactive_auth=True) is not None
-            if google_ok:
-                mark_google_setup_complete()
+        settings = load_settings()
+
+        google_ok = True
+        if settings.get("calendar_sync_enabled"):
+            google_ok = is_google_setup_complete()
+            if not google_ok:
+                google_ok = get_google_calendar_service(
+                    interactive_auth=True,
+                    show_prompt_before_auth=True,
+                ) is not None
+                if google_ok:
+                    mark_google_setup_complete()
 
         context.close()
-
-    show_windows_popup(
-        "Classflow Teams Login",
-        "Teams login/setup successful." if teams_ok else "Teams login/setup failed. Please rerun and complete Teams login."
-    )
-
-    show_windows_popup(
-        "Classflow Google Login",
-        "Google login/setup successful." if google_ok else "Google login/setup failed. Please rerun and complete Google login."
-    )
 
     if teams_ok and google_ok:
         show_windows_popup(
@@ -524,9 +1008,16 @@ def first_time_setup():
     )
     return False
 
-
 def run():
-    if not is_teams_setup_complete() or not is_google_setup_complete():
+    settings = ensure_first_time_setup_completed()
+    if not settings:
+        return
+
+    download_dir = ensure_download_directory_configured(settings)
+    if not download_dir:
+        return
+
+    if not is_teams_setup_complete() or (settings.get("calendar_sync_enabled") and not is_google_setup_complete()):
         first_time_setup()
         return
     
@@ -556,7 +1047,7 @@ def run():
         assignment_cards = iframe.locator(target_card_id)
         total_assignments = assignment_cards.count()
         
-        log_output(f"Found {total_assignments} upcoming assignment(s).", show_popup=IS_FROZEN, title="Classflow")
+        log_output(f"Found {total_assignments} upcoming assignment(s).", show_popup=False, title="Classflow")
         
         for i in range(total_assignments):
             iframe = page.locator("iframe[name=\"embedded-page-container\"]").content_frame
@@ -653,7 +1144,7 @@ def run():
                         safe_title = re.sub(r'[\\/*?:"<>|]', "", assignment_info['title'])
                         
                         new_filename = f"{safe_course} - {safe_title} - {original_filename}"
-                        final_path = os.path.join(DOWNLOAD_DIR, new_filename)
+                        final_path = os.path.join(download_dir, new_filename)
 
                         if os.path.exists(final_path):
                             log_output(f"    => Skipping: '{new_filename}' already exists.")
@@ -698,82 +1189,68 @@ def run():
         
     pyperclip.copy(formatted_list)
     
-    try:
-        subprocess.Popen([
-            "explorer.exe",
-            "shell:appsFolder\\Microsoft.MicrosoftStickyNotes_8wekyb3d8bbwe!App"
-        ])
-    except Exception as e:
-        log_output(f"Could not open Sticky Notes: {e}", show_popup=False)
+    if settings.get("sticky_notes_enabled"):
+        try:
+            subprocess.Popen([
+                "explorer.exe",
+                "shell:appsFolder\\Microsoft.MicrosoftStickyNotes_8wekyb3d8bbwe!App"
+            ])
+            time.sleep(3)
+            pyautogui.hotkey('ctrl', 'a')  # Select all
+            time.sleep(0.3)
+            pyautogui.press('delete')      # Delete selected text
+            time.sleep(0.3)
+            pyautogui.hotkey('ctrl', 'v')  # Paste from clipboard
+            log_output("Deadlines were copied to clipboard and pasted into Sticky Notes.", show_popup=False, title="Classflow")
+        except Exception as e:
+            log_output(f"Could not update Sticky Notes: {e}", show_popup=False)
+    else:
+        log_output("Sticky Notes sync disabled in setup settings.", show_popup=False)
 
-    time.sleep(3)
-    pyautogui.hotkey('ctrl', 'a')  # Select all
-    time.sleep(0.3)
-    pyautogui.press('delete')      # Delete selected text
-    time.sleep(0.3)
-    pyautogui.hotkey('ctrl', 'v')  # Paste from clipboard
-
-    if changed_deadlines:
-        sync_result = sync_deadlines_to_google_calendar(changed_deadlines, interactive_auth=True)
-        if sync_result["ok"]:
-            show_windows_popup(
-                "Classflow Calendar Sync",
-                "Google Calendar API sync completed.\n\n"
-                f"Inserted: {sync_result['inserted']}\n"
-                f"Updated: {sync_result['updated']}\n"
-                f"Skipped (invalid dates): {sync_result['skipped']}"
+    if settings.get("calendar_sync_enabled"):
+        if changed_deadlines:
+            sync_result = sync_deadlines_to_google_calendar(
+                changed_deadlines,
+                interactive_auth=True,
+                calendar_id=settings.get("calendar_id", "primary"),
             )
+            if sync_result["ok"]:
+                log_output(
+                    "Google Calendar API sync completed. "
+                    f"Inserted: {sync_result['inserted']}, "
+                    f"Updated: {sync_result['updated']}, "
+                    f"Skipped: {sync_result['skipped']}",
+                    show_popup=False,
+                )
+                show_windows_popup(
+                    "Classflow Calendar Sync",
+                    "Google Calendar API sync completed.\n\n"
+                    f"Inserted: {sync_result['inserted']}\n"
+                    f"Updated: {sync_result['updated']}\n"
+                    f"Skipped: {sync_result['skipped']}"
+                )
+            else:
+                show_windows_popup(
+                    "Classflow Calendar Sync",
+                    "Google Calendar API sync failed for some items.\n\n"
+                    f"Inserted: {sync_result['inserted']}\n"
+                    f"Updated: {sync_result['updated']}\n"
+                    f"Failed: {sync_result['failed']}"
+                )
         else:
+            log_output("No changed deadlines were detected, so no Google Calendar API sync was needed.", show_popup=False)
             show_windows_popup(
                 "Classflow Calendar Sync",
-                "Google Calendar API sync failed for some items.\n\n"
-                f"Inserted: {sync_result['inserted']}\n"
-                f"Updated: {sync_result['updated']}\n"
-                f"Failed: {sync_result['failed']}"
+                "No changed deadlines were detected, so no Google Calendar API sync was needed."
             )
     else:
-        show_windows_popup(
-            "Classflow Calendar Sync",
-            "No changed deadlines were detected, so no Google Calendar API sync was needed."
-        )
-    
-    log_output("Deadlines were copied to clipboard and pasted into Sticky Notes.", show_popup=IS_FROZEN, title="Classflow")
+        log_output("Google Calendar sync disabled in setup settings.", show_popup=False)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Classflow assignment automation")
-    parser.add_argument(
-        "--install-schedule",
-        action="store_true",
-        help="Create Windows Task Scheduler jobs at 12:00 and 18:00 daily.",
-    )
-    parser.add_argument(
-        "--remove-schedule",
-        action="store_true",
-        help="Remove Windows Task Scheduler jobs created by Classflow.",
-    )
     args = parser.parse_args()
 
-    if args.install_schedule and args.remove_schedule:
-        log_output("Use only one option at a time: --install-schedule or --remove-schedule", show_popup=False)
-        sys.exit(1)
-
-    if args.install_schedule:
-        try:
-            install_schedule()
-            log_output("Classflow schedule installed for 12:00 and 18:00 daily.", show_popup=True, title="Classflow Setup")
-        except Exception as e:
-            log_output(f"Failed to install schedule: {e}", show_popup=True, title="Classflow Setup Error")
-            sys.exit(1)
-        sys.exit(0)
-
-    if args.remove_schedule:
-        try:
-            remove_schedule()
-            log_output("Classflow schedule removed.", show_popup=True, title="Classflow Setup")
-        except Exception as e:
-            log_output(f"Failed to remove schedule: {e}", show_popup=True, title="Classflow Setup Error")
-            sys.exit(1)
-        sys.exit(0)
+    initialize_runtime_logging()
 
     try:
         run()

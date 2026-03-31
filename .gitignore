@@ -1,5 +1,20 @@
-google_client_secret.json
-client_secret.json
+# Virtual Environments and Build Environments (Folders)
 .venv/
-__pycache__/
-*.pyc
+.buildenv/
+
+# Build Artifacts (Folders)
+build/
+dist/
+
+# Project Specific Files
+classflow.ico
+Classflow.spec
+codegen_launcher.py
+get_auth.py
+
+# Legacy Data (Folder)
+Legacy/
+
+
+# Sensitive Data 
+google_client_secret.json
