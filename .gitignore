@@ -5,15 +5,7 @@
 # Build Artifacts (Folders)
 build/
 dist/
-
-# Project Specific Files
-Classflow/App/classflow.ico
-Classflow/App/Classflow.spec
-Classflow/App/codegen_launcher.py
-Classflow/App/get_auth.py
-
-# Legacy Data (Folder)
-Classflow/Legacy/
+Ignore/
 
 # Sensitive Data 
 google_client_secret.json
