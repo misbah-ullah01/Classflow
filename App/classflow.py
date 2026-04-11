@@ -8,7 +8,7 @@ import subprocess
 import time
 import pyautogui
 import ctypes
-import sys
+import sys 
 import atexit
 from datetime import datetime, timedelta, timezone
 from playwright.sync_api import sync_playwright
@@ -39,10 +39,11 @@ PROFILE_DIR = os.path.join(os.environ['LOCALAPPDATA'], "Classflow")
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR = os.path.dirname(SCRIPT_DIR)
 
-DEADLINE_FILE = os.path.join(OUTPUT_DIR, "deadlines.txt")
-HISTORY_FILE = os.path.join(OUTPUT_DIR, "assignment_history.json")
+DEADLINE_FILE = os.path.join(PROFILE_DIR, "deadlines.txt")
+HISTORY_FILE = os.path.join(PROFILE_DIR, "assignment_history.json")
 GOOGLE_SETUP_FILE = os.path.join(PROFILE_DIR, "google_calendar_setup.flag")
 TEAMS_SETUP_FILE = os.path.join(PROFILE_DIR, "teams_setup.flag")
+CLASSFLOW_INTRO_FILE = os.path.join(PROFILE_DIR, "classflow_intro_shown.flag")
 GOOGLE_TOKEN_FILE = os.path.join(PROFILE_DIR, "google_token.json")
 SETTINGS_FILE = os.path.join(PROFILE_DIR, "classflow_settings.json")
 GOOGLE_SCOPES = ["https://www.googleapis.com/auth/calendar.events"]
@@ -51,7 +52,7 @@ GOOGLE_CLIENT_SECRET_CANDIDATES = [
     "credentials.json",
     "client_secret.json"
 ]
-DEFAULT_TASK_NAME = "Classflow Daily"
+DEFAULT_TASK_NAME = "Classflow"
 DEFAULT_SETTINGS = {
     "download_dir": "",
     "sticky_notes_enabled": True,
@@ -423,6 +424,12 @@ def ensure_first_time_setup_completed():
     if os.path.exists(SETTINGS_FILE):
         return load_settings()
 
+    show_windows_popup(
+        "Welcome to Classflow",
+        "Welcome to Classflow!\n\n"
+        "Press OK to start your first-time setup."
+    )
+
     payload = show_first_time_setup_dialog()
     if not payload:
         log_output("First-time setup cancelled by user.", show_popup=False)
@@ -468,6 +475,16 @@ def mark_teams_setup_complete():
     with open(TEAMS_SETUP_FILE, "w", encoding="utf-8") as f:
         f.write(datetime.now().isoformat())
 
+def is_classflow_intro_shown():
+    """Check whether the intro dialogue has been shown to the user."""
+    return os.path.exists(CLASSFLOW_INTRO_FILE)
+
+def mark_classflow_intro_shown():
+    """Persist intro dialogue shown marker."""
+    os.makedirs(PROFILE_DIR, exist_ok=True)
+    with open(CLASSFLOW_INTRO_FILE, "w", encoding="utf-8") as f:
+        f.write(datetime.now().isoformat())
+
 def clean_date_string(raw_text):
     """Just strips the word 'Due ' from the text."""
     return raw_text.replace("Due ", "").strip()
@@ -477,8 +494,34 @@ def parse_due_date(raw_due_date):
     if not raw_due_date or raw_due_date == "No date specified":
         return None
 
-    cleaned = raw_due_date.replace(" at ", " ").strip()
+    cleaned = raw_due_date.strip()
     cleaned = re.sub(r"\s+", " ", cleaned)
+
+    # Handle relative Teams strings like "Today at 11:59 PM" and "Tomorrow at 11:59 PM".
+    relative_match = re.match(
+        r"^(today|tomorrow)(?:\s+at)?(?:\s+(\d{1,2}:\d{2}\s*[ap]m))?$",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    if relative_match:
+        day_word = relative_match.group(1).lower()
+        time_part = relative_match.group(2)
+
+        base_date = datetime.now().date()
+        if day_word == "tomorrow":
+            base_date += timedelta(days=1)
+
+        if time_part:
+            try:
+                parsed_time = datetime.strptime(time_part.strip().upper(), "%I:%M %p").time()
+            except ValueError:
+                return None
+        else:
+            parsed_time = datetime.min.time()
+
+        return datetime.combine(base_date, parsed_time)
+
+    cleaned = cleaned.replace(" at ", " ")
 
     date_formats = [
         "%A, %B %d, %Y %I:%M %p",
@@ -781,12 +824,19 @@ def build_google_event(unique_name, due_text):
     if parsed_due is None:
         return None
 
+    has_explicit_time = "am" in due_text.lower() or "pm" in due_text.lower()
+    resolved_due_text = (
+        parsed_due.strftime("%A, %B %d, %Y %I:%M %p")
+        if has_explicit_time
+        else parsed_due.strftime("%A, %B %d, %Y")
+    )
+
     event = {
         "summary": unique_name,
-        "description": f"Assignment deadline: {due_text}"
+        "description": f"Assignment deadline: {resolved_due_text}"
     }
 
-    if parsed_due.hour == 0 and parsed_due.minute == 0 and "am" not in due_text.lower() and "pm" not in due_text.lower():
+    if parsed_due.hour == 0 and parsed_due.minute == 0 and not has_explicit_time:
         event["start"] = {"date": parsed_due.strftime("%Y-%m-%d")}
         event["end"] = {"date": (parsed_due + timedelta(days=1)).strftime("%Y-%m-%d")}
     else:
@@ -795,7 +845,7 @@ def build_google_event(unique_name, due_text):
             parsed_due = parsed_due.replace(tzinfo=local_tz)
 
         due_utc = parsed_due.astimezone(timezone.utc)
-        start_utc = (parsed_due - timedelta(minutes=30)).astimezone(timezone.utc)
+        start_utc = (parsed_due - timedelta(minutes=60)).astimezone(timezone.utc)
         event["start"] = {"dateTime": start_utc.strftime("%Y-%m-%dT%H:%M:%SZ")}
         event["end"] = {"dateTime": due_utc.strftime("%Y-%m-%dT%H:%M:%SZ")}
 
@@ -861,13 +911,6 @@ def open_teams_and_wait_for_assignments(page, setup_mode=False):
     log_output("Opening Microsoft Teams...", show_popup=False, title="Classflow")
     page.set_default_navigation_timeout(60000)
     page.set_default_timeout(600000 if setup_mode else 60000)
-
-    if setup_mode:
-        show_windows_popup(
-            "Teams Setup",
-            "Press OK to open Teams sign-in in Chrome. Complete login and any prompts, then continue."
-        )
-        log_output("Teams setup required. Chrome will open for sign-in after this prompt.", show_popup=False, title="Classflow Setup")
 
     try:
         page.goto("https://teams.microsoft.com/v2/", timeout=60000)
@@ -961,9 +1004,43 @@ def format_assignment_name(course_name, assignment_title):
     """Use clean display naming without square brackets."""
     return f"{course_name} - {assignment_title}"
 
+def show_classflow_info_dialogue(settings):
+    """Show comprehensive info dialogue about what Classflow will do."""
+    sticky_notes_enabled = settings.get("sticky_notes_enabled", True)
+    calendar_sync_enabled = settings.get("calendar_sync_enabled", True)
+    
+    info_text = (
+        "Classflow is ready to track your assignments!\n\n"
+        "Here's what will happen:\n\n"
+        "1. Classflow will open Microsoft Teams and guide first-time login \n"
+        "2. If Calendar Sync is enabled, Google authentication will open once\n"
+        "3. It will detect deadlines and download your assignments from Teams \n\n"
+    )
+    
+    if sticky_notes_enabled:
+        info_text += "• Your Sticky Notes will be updated with your assignment deadlines\n"
+    
+    if calendar_sync_enabled:
+        info_text += "• Your Google Calendar will be synced with all assignment deadlines\n"
+    
+    if not sticky_notes_enabled and not calendar_sync_enabled:
+        info_text += "• Assignment data will be extracted and saved only\n"
+    
+    info_text += (
+        "\n4. At the end you will receive a summary of the sync results\n\n"
+        "This process typically takes a few minutes."
+    )
+    
+    show_windows_popup("About Classflow", info_text)
+
 def first_time_setup():
     """Complete one-time Teams and Google setup, then ask user to rerun."""
     log_output("First-time setup detected. Starting account setup...", show_popup=False, title="Classflow Setup")
+
+    settings = load_settings()
+    if not is_classflow_intro_shown():
+        show_classflow_info_dialogue(settings)
+        mark_classflow_intro_shown()
 
     with sync_playwright() as p:
         context = p.chromium.launch_persistent_context(
@@ -980,15 +1057,13 @@ def first_time_setup():
             if teams_ok:
                 mark_teams_setup_complete()
 
-        settings = load_settings()
-
         google_ok = True
         if settings.get("calendar_sync_enabled"):
             google_ok = is_google_setup_complete()
             if not google_ok:
                 google_ok = get_google_calendar_service(
                     interactive_auth=True,
-                    show_prompt_before_auth=True,
+                    show_prompt_before_auth=False,
                 ) is not None
                 if google_ok:
                     mark_google_setup_complete()
@@ -1020,6 +1095,11 @@ def run():
     if not is_teams_setup_complete() or (settings.get("calendar_sync_enabled") and not is_google_setup_complete()):
         first_time_setup()
         return
+    
+    # Show intro dialogue on first run after setup
+    if not is_classflow_intro_shown():
+        show_classflow_info_dialogue(settings)
+        mark_classflow_intro_shown()
     
     master_deadlines = {}
     history = load_history()
